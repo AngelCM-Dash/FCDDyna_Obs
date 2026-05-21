@@ -116,6 +116,100 @@ function Test-OneAgentConnectivity {
     Pause-Menu
 }
 
+function Get-RecommendedConnectionPatterns {
+    return @(
+        # Conexion correcta / sincronizacion
+        "Connected successfully",
+        "Registration successful",
+        "Configuration received",
+        "Communication upload statistics",
+        "acked",
+        "cluster time",
+        "AgentId",
+
+        # Problemas de tenant, gateway o comunicacion
+        "http status: 410",
+        "Connection to all gateways failed",
+        "not working",
+        "Could not resolve host",
+        "Certificate check failed",
+        "Heartbeat failed",
+        "cluster time is not yet available",
+        "Dropping package list report",
+        "unauthorized",
+        "forbidden",
+        "authentication",
+        "SSL",
+        "TLS",
+        "proxy",
+        "tenant",
+        "token"
+    )
+}
+
+function Show-RecommendedLogLines {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LogPath,
+
+        [int]$TailLines = 600,
+
+        [int]$MaxMatches = 40
+    )
+
+    Write-Host ""
+    Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "Log:" -ForegroundColor Cyan
+    Write-Host $LogPath
+    Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
+
+    if (-not (Test-Path $LogPath)) {
+        Write-Host "No se encontro el archivo de log." -ForegroundColor Red
+        return
+    }
+
+    $patterns = Get-RecommendedConnectionPatterns
+    $content = Get-Content $LogPath -Tail $TailLines -ErrorAction SilentlyContinue
+
+    if (-not $content -or $content.Count -eq 0) {
+        Write-Host "El log esta vacio o no se pudo leer." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "Lineas recomendadas para validar conexion con Dynatrace:" -ForegroundColor Yellow
+    Write-Host "- Exitosas: Connected successfully, Registration successful, Communication upload statistics, acked, cluster time."
+    Write-Host "- Problemas: http status: 410, Connection to all gateways failed, Could not resolve host, Certificate check failed, Heartbeat failed."
+    Write-Host ""
+
+    $matches = $content | Select-String -Pattern $patterns -SimpleMatch
+
+    if ($matches) {
+        Write-Host "Coincidencias encontradas en las ultimas $TailLines lineas:" -ForegroundColor Green
+        $matches |
+            Select-Object -Last $MaxMatches |
+            ForEach-Object {
+                $line = $_.Line
+
+                if ($line -match "Connected successfully|Registration successful|acked|Communication upload statistics") {
+                    Write-Host $line -ForegroundColor Green
+                }
+                elseif ($line -match "http status: 410|Connection to all gateways failed|Could not resolve host|Certificate check failed|Heartbeat failed|not working|unauthorized|forbidden|authentication") {
+                    Write-Host $line -ForegroundColor Red
+                }
+                elseif ($line -match "cluster time is not yet available|Dropping package list report") {
+                    Write-Host $line -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host $line
+                }
+            }
+    } else {
+        Write-Host "No se encontraron coincidencias clave en las ultimas $TailLines lineas." -ForegroundColor Yellow
+        Write-Host "Mostrando las ultimas 20 lineas para revision manual:" -ForegroundColor Yellow
+        $content | Select-Object -Last 20 | ForEach-Object { Write-Host $_ }
+    }
+}
+
 function Get-LatestLogs {
     Write-Header "Ultimos logs"
 
@@ -126,10 +220,65 @@ function Get-LatestLogs {
         return
     }
 
-    Get-ChildItem $LogRoot -Recurse -Filter "*.log" |
+    $logs = Get-ChildItem $LogRoot -Recurse -Filter "*.log" |
         Sort-Object LastWriteTime -Descending |
-        Select-Object -First 15 FullName, LastWriteTime |
+        Select-Object -First 15
+
+    if (-not $logs -or $logs.Count -eq 0) {
+        Write-Host "No se encontraron archivos .log en:" -ForegroundColor Yellow
+        Write-Host $LogRoot
+        Pause-Menu
+        return
+    }
+
+    Write-Host "Ultimos logs encontrados:" -ForegroundColor Yellow
+    $logs |
+        Select-Object `
+            @{Name = "Nro"; Expression = { [array]::IndexOf($logs, $_) + 1 } },
+            FullName,
+            LastWriteTime,
+            @{Name = "SizeKB"; Expression = { [math]::Round($_.Length / 1KB, 2) } } |
         Format-Table -AutoSize
+
+    Write-Host ""
+    $viewAnswer = Read-Host "Quieres visualizar lineas recomendadas de los ultimos logs? (S/N)"
+
+    if ($viewAnswer -notmatch "^[sS]$") {
+        Pause-Menu
+        return
+    }
+
+    $countInput = Read-Host "Cuantos ultimos logs quieres visualizar? Ejemplo: 5, 8 o 10"
+    $count = 0
+
+    if (-not [int]::TryParse($countInput, [ref]$count)) {
+        Write-Host "Valor invalido. Se usaran 5 logs por defecto." -ForegroundColor Yellow
+        $count = 5
+    }
+
+    if ($count -lt 1) { $count = 1 }
+    if ($count -gt $logs.Count) { $count = $logs.Count }
+
+    $tailInput = Read-Host "Cuantas lineas finales revisar por cada log? Presiona ENTER para usar 600"
+    $tailLines = 600
+
+    if (-not [string]::IsNullOrWhiteSpace($tailInput)) {
+        $parsedTail = 0
+        if ([int]::TryParse($tailInput, [ref]$parsedTail) -and $parsedTail -gt 0) {
+            $tailLines = $parsedTail
+        } else {
+            Write-Host "Valor invalido. Se usaran 600 lineas por defecto." -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Visualizando los ultimos $count logs. Por cada log se imprimen lineas clave para validar el estado de conexion." -ForegroundColor Cyan
+
+    $logsToView = $logs | Select-Object -First $count
+
+    foreach ($log in $logsToView) {
+        Show-RecommendedLogLines -LogPath $log.FullName -TailLines $tailLines -MaxMatches 40
+    }
 
     Pause-Menu
 }
