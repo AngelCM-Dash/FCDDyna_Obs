@@ -1,6 +1,6 @@
 # OneAgent-Diagnostics-Menu.ps1
 # Ejecutar como Administrador
-# Version v4: ingreso compatible del API token InstallerDownload para evitar SecureString vacio
+# Version v5: ingreso compatible del Tenant Token y timeout controlado para prueba TCP 443
 
 $OneAgentCtl = "C:\Program Files\Dynatrace\OneAgent\agent\tools\oneagentctl.exe"
 $LogRoot = "C:\ProgramData\dynatrace\oneagent\log"
@@ -169,6 +169,62 @@ function Get-OneAgentRuntimeInfo {
     return [pscustomobject]$info
 }
 
+function Test-TcpPortWithTimeout {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ComputerName,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Port,
+
+        [int]$TimeoutMilliseconds = 8000
+    )
+
+    $tcpClient = New-Object System.Net.Sockets.TcpClient
+    $asyncResult = $null
+
+    try {
+        $asyncResult = $tcpClient.BeginConnect($ComputerName, $Port, $null, $null)
+
+        if (-not $asyncResult.AsyncWaitHandle.WaitOne($TimeoutMilliseconds, $false)) {
+            return [pscustomobject]@{
+                ComputerName     = $ComputerName
+                RemotePort       = $Port
+                TcpTestSucceeded = $false
+                TimedOut         = $true
+                TimeoutMs        = $TimeoutMilliseconds
+                Error            = "Tiempo de espera agotado al intentar conexion TCP."
+            }
+        }
+
+        $tcpClient.EndConnect($asyncResult)
+
+        return [pscustomobject]@{
+            ComputerName     = $ComputerName
+            RemotePort       = $Port
+            TcpTestSucceeded = $true
+            TimedOut         = $false
+            TimeoutMs        = $TimeoutMilliseconds
+            Error            = ""
+        }
+    } catch {
+        return [pscustomobject]@{
+            ComputerName     = $ComputerName
+            RemotePort       = $Port
+            TcpTestSucceeded = $false
+            TimedOut         = $false
+            TimeoutMs        = $TimeoutMilliseconds
+            Error            = $_.Exception.Message
+        }
+    } finally {
+        if ($null -ne $asyncResult -and $null -ne $asyncResult.AsyncWaitHandle) {
+            $asyncResult.AsyncWaitHandle.Close()
+        }
+
+        $tcpClient.Close()
+    }
+}
+
 function Test-OneAgentEndpointConnectivity {
     param(
         [Parameter(Mandatory = $true)]
@@ -196,7 +252,9 @@ function Test-OneAgentEndpointConnectivity {
         $result.DnsError = $_.Exception.Message
     }
 
-    $tcp = Test-NetConnection $result.HostName -Port 443 -WarningAction SilentlyContinue
+    # Evita que Test-NetConnection quede demasiado tiempo en "Waiting for response".
+    # La prueba TCP se cancela logicamente despues de 8 segundos.
+    $tcp = Test-TcpPortWithTimeout -ComputerName $result.HostName -Port 443 -TimeoutMilliseconds 8000
     $result.TcpDetails = $tcp
     $result.TcpOk = ($null -ne $tcp -and $tcp.TcpTestSucceeded)
 
@@ -268,6 +326,44 @@ function Read-ApiTokenPlainText {
     Write-Host "No se guardara en el script ni se imprimira completo despues." -ForegroundColor Yellow
     $plainValue = Microsoft.PowerShell.Utility\Read-Host -Prompt (" " + $Prompt)
 
+    return (Normalize-SecretText -Value $plainValue)
+}
+
+
+function Read-TenantTokenPlainText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Prompt
+    )
+
+    Write-Host ""
+    Write-Host "Modo de ingreso del Tenant Token:" -ForegroundColor Yellow
+    Write-Host "1. Visible / compatible (recomendado en esta consola)"
+    Write-Host "2. Oculto / SecureString"
+    Write-Host ""
+
+    $mode = Read-Host "Selecciona modo o ENTER para usar 1"
+    $mode = Normalize-PlainInput -Value $mode
+
+    if ($mode -eq "2") {
+        Write-Host "Pega el Tenant Token y presiona ENTER para continuar." -ForegroundColor DarkGray
+        $value = Read-SecretPlainText $Prompt
+        $value = Normalize-SecretText -Value $value
+
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            return $value
+        }
+
+        Write-Host "El modo oculto devolvio un valor vacio en esta consola." -ForegroundColor Yellow
+        Write-Host "Se cambiara automaticamente al modo visible compatible." -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    Write-Host "Pega el Tenant Token y presiona ENTER." -ForegroundColor Yellow
+    Write-Host "El valor sera visible solo durante el ingreso." -ForegroundColor Yellow
+    Write-Host "Despues el script solo mostrara el token enmascarado." -ForegroundColor Yellow
+
+    $plainValue = Microsoft.PowerShell.Utility\Read-Host -Prompt (" " + $Prompt)
     return (Normalize-SecretText -Value $plainValue)
 }
 
@@ -1059,7 +1155,7 @@ function Set-NewTenant {
     $hasTenantToken = Read-Host "Ya tienes el nuevo Tenant Token? (S/N). Si respondes N, se consultara con Deployment API"
 
     if ($hasTenantToken -match "^[sS]$") {
-        $tenantToken = Read-SecretPlainText "Ingresa el nuevo Tenant Token"
+        $tenantToken = Read-TenantTokenPlainText "Ingresa el nuevo Tenant Token"
         $tenantToken = Normalize-SecretText -Value $tenantToken
     } else {
         $info = Get-NewTenantConnectionInfo -EnvironmentId $newTenant -ReturnInfo
